@@ -1,0 +1,5 @@
+fastapi>=0.111
+uvicorn[standard]>=0.30
+msal>=1.29
+requests>=2.31
+python-multipart>=0.0.9

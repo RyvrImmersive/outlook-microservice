@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: outlook-microservice
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TENANT_ID
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: CLIENT_SECRET
+        sync: false
+      - key: DEFAULT_USER_EMAIL
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: GRAPH_BASE
+        value: https://graph.microsoft.com/v1.0
