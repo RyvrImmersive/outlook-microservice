@@ -1,55 +1,76 @@
-import base64
-import os
+# main.py — Delegated OAuth (Authorization Code + refresh token)
+import base64, json, os, threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import msal
 import requests
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-# ------------------ Config ------------------
-
-GRAPH_BASE = os.getenv("GRAPH_BASE", "https://graph.microsoft.com/v1.0")
-
-TENANT_ID = os.getenv("TENANT_ID", "").strip()
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "").strip()
+AUTHORITY = os.getenv("AUTHORITY", "https://login.microsoftonline.com/common").strip()
+REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
+API_KEY = os.getenv("API_KEY", "").strip()  # optional
 
-DEFAULT_USER_EMAIL = os.getenv("DEFAULT_USER_EMAIL", "").strip()  # fallback mailbox
-API_KEY = os.getenv("API_KEY", "").strip()  # optional: simple header auth
+if not (CLIENT_ID and CLIENT_SECRET and REDIRECT_URI):
+    raise RuntimeError("Set CLIENT_ID, CLIENT_SECRET, REDIRECT_URI env vars.")
 
-if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET):
-    raise RuntimeError("TENANT_ID, CLIENT_ID, CLIENT_SECRET must be set as env vars")
+# where we store a single-user token cache (fine for your use case)
+TOKEN_PATH = os.getenv("TOKEN_PATH", "/data/ms_tokens.json")
+os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+_cache_lock = threading.Lock()
 
-# ------------------ Auth ------------------
+# ---- MSAL helpers ----
+def _load_cache() -> msal.SerializableTokenCache:
+    cache = msal.SerializableTokenCache()
+    if os.path.exists(TOKEN_PATH):
+        try:
+            cache.deserialize(open(TOKEN_PATH, "r").read())
+        except Exception:
+            pass
+    return cache
 
-def acquire_token() -> str:
-    """
-    App-only (client credentials) token. Requires:
-    - App registration in same Entra tenant as the target mailbox
-    - Microsoft Graph Application permission: Mail.Read (admin consent)
-    """
-    app = msal.ConfidentialClientApplication(
+def _save_cache(cache: msal.SerializableTokenCache):
+    if cache.has_state_changed:
+        with open(TOKEN_PATH, "w") as f:
+            f.write(cache.serialize())
+
+def _build_app(cache: Optional[msal.SerializableTokenCache] = None) -> msal.ConfidentialClientApplication:
+    return msal.ConfidentialClientApplication(
         client_id=CLIENT_ID,
         client_credential=CLIENT_SECRET,
-        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+        authority=AUTHORITY,
+        token_cache=cache,
     )
-    res = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-    if "access_token" not in res:
-        raise HTTPException(status_code=500, detail=f"Token error: {res}")
-    return res["access_token"]
 
-# ------------------ Models ------------------
+SCOPES = ["Mail.Read", "offline_access", "openid", "profile"]
 
+def _ensure_token() -> str:
+    """Return a valid access token using the stored refresh token (silent flow)."""
+    with _cache_lock:
+        cache = _load_cache()
+        app = _build_app(cache)
+        accounts = app.get_accounts()
+        result = None
+        if accounts:
+            result = app.acquire_token_silent(SCOPES, account=accounts[0])
+        if not result or "access_token" not in result:
+            raise HTTPException(status_code=401, detail="Not authorized. Visit /auth/start to sign in.")
+        _save_cache(cache)
+        return result["access_token"]
+
+# ---- FastAPI models ----
 class SearchRequest(BaseModel):
-    user_email: Optional[str] = Field(None, description="Target mailbox; defaults to DEFAULT_USER_EMAIL")
-    sender_email: Optional[str] = Field(None, description="Filter: exact from address")
-    subject_contains: Optional[str] = Field(None, description="Filter: subject contains text")
-    days_back: int = Field(7, ge=0, le=365)
+    sender_email: Optional[str] = None
+    subject_contains: Optional[str] = None
+    days_back: int = Field(30, ge=0, le=365)
     top: int = Field(25, ge=1, le=100)
-    folder: str = Field("inbox", description="Well-known name or folder id")
-    has_attachments: Optional[bool] = Field(None, description="If true, only messages with attachments")
+    folder: str = Field("inbox")
+    has_attachments: Optional[bool] = None
 
 class AttachmentInfo(BaseModel):
     attachmentId: str
@@ -73,7 +94,6 @@ class SearchResponse(BaseModel):
     debug: Dict[str, Any] = {}
 
 class DownloadRequest(BaseModel):
-    user_email: Optional[str]
     message_id: str
     attachment_id: str
 
@@ -83,18 +103,53 @@ class DownloadResponse(BaseModel):
     size: int
     content_base64: str
 
-# ------------------ FastAPI ------------------
+# ---- FastAPI app ----
+app = FastAPI(title="Outlook Delegated Microservice", version="1.0.0")
 
-app = FastAPI(title="Outlook Attachment Microservice", version="1.0.0")
-
-def check_api_key(x_api_key: Optional[str]):
+def _check_api_key(x_api_key: Optional[str]):
     if API_KEY and (x_api_key or "").strip() != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-def graph_headers() -> Dict[str, str]:
-    return {"Authorization": f"Bearer {acquire_token()}"}
+@app.get("/")
+def root():
+    return {"ok": True, "auth": "/auth/start", "docs": "/docs"}
 
-def normalize_message(m: Dict[str, Any]) -> MessageItem:
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.get("/auth/start")
+def auth_start():
+    cache = _load_cache()
+    appc = _build_app(cache)
+    # Create login URL
+    auth_url = appc.get_authorization_request_url(
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+        prompt="select_account",
+        response_mode="query",
+    )
+    return RedirectResponse(auth_url)
+
+@app.get("/auth/callback")
+def auth_callback(request: Request):
+    code = request.query_params.get("code")
+    if not code:
+        err = request.query_params.get("error_description", "No code")
+        return JSONResponse({"error": err}, status_code=400)
+    with _cache_lock:
+        cache = _load_cache()
+        appc = _build_app(cache)
+        result = appc.acquire_token_by_authorization_code(code, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+        if "access_token" not in result:
+            return JSONResponse({"error": result}, status_code=400)
+        _save_cache(cache)
+    return JSONResponse({"ok": True, "message": "Authorized. You can close this tab."})
+
+def _graph_headers() -> Dict[str, str]:
+    return {"Authorization": f"Bearer {_ensure_token()}"}
+
+def _normalize_message(m: Dict[str, Any]) -> MessageItem:
     ea = ((m.get("from") or {}).get("emailAddress") or {})
     return MessageItem(
         messageId=m.get("id", ""),
@@ -107,115 +162,81 @@ def normalize_message(m: Dict[str, Any]) -> MessageItem:
         attachments=[],
     )
 
-def list_messages(
-    user_email: str,
-    folder: str,
-    top: int,
-    days_back: int,
-    sender_email: Optional[str],
-    subject_contains: Optional[str],
-    has_attachments: Optional[bool],
-) -> List[Dict[str, Any]]:
-    since = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+@app.post("/search", response_model=SearchResponse)
+def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
+    _check_api_key(x_api_key)
+    headers = _graph_headers()
+
+    # Build OData filters
+    from datetime import timedelta
+    since = (datetime.now(timezone.utc) - timedelta(days=req.days_back)).isoformat()
     filters = [f"receivedDateTime ge {since}"]
-    if sender_email:
-        addr = sender_email.replace("'", "''").lower()
+    if req.sender_email:
+        addr = req.sender_email.replace("'", "''").lower()
         filters.append(f"from/emailAddress/address eq '{addr}'")
-    if subject_contains:
-        val = subject_contains.replace("'", "''")
+    if req.subject_contains:
+        val = req.subject_contains.replace("'", "''")
         filters.append(f"contains(subject,'{val}')")
-    if has_attachments is True:
+    if req.has_attachments is True:
         filters.append("hasAttachments eq true")
-    if has_attachments is False:
+    if req.has_attachments is False:
         filters.append("hasAttachments eq false")
 
     params = {
         "$select": "id,subject,from,receivedDateTime,webLink,hasAttachments",
         "$orderby": "receivedDateTime desc",
-        "$top": str(top),
+        "$top": str(req.top),
         "$filter": " and ".join(filters),
     }
-    url = f"{GRAPH_BASE}/users/{user_email}/mailFolders/{folder}/messages"
-    r = requests.get(url, headers=graph_headers(), params=params, timeout=30)
+    url = f"{GRAPH_BASE}/me/mailFolders/{req.folder or 'inbox'}/messages"
+    r = requests.get(url, headers=headers, params=params, timeout=30)
     if r.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"Graph list error {r.status_code}: {r.text}")
-    return r.json().get("value", []) or []
 
-def list_attachments(user_email: str, message_id: str) -> List[Dict[str, Any]]:
-    url = f"{GRAPH_BASE}/users/{user_email}/messages/{message_id}/attachments"
-    params = {"$select": "id,name,contentType,size"}
-    r = requests.get(url, headers=graph_headers(), params=params, timeout=30)
-    if r.status_code >= 400:
-        # don't fail the whole request; return empty
-        return []
-    return r.json().get("value", []) or []
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-@app.post("/search", response_model=SearchResponse)
-def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
-    check_api_key(x_api_key)
-    user_email = (req.user_email or DEFAULT_USER_EMAIL).strip()
-    if not user_email:
-        raise HTTPException(status_code=400, detail="user_email missing (and DEFAULT_USER_EMAIL not set)")
-
-    raw = list_messages(
-        user_email=user_email,
-        folder=req.folder or "inbox",
-        top=req.top,
-        days_back=req.days_back,
-        sender_email=req.sender_email,
-        subject_contains=req.subject_contains,
-        has_attachments=req.has_attachments,
-    )
-
+    raw = r.json().get("value", []) or []
     items: List[MessageItem] = []
     for m in raw:
-        item = normalize_message(m)
+        item = _normalize_message(m)
         if item.hasAttachments:
-            atts = list_attachments(user_email, item.messageId)
-            item.attachments = [
-                AttachmentInfo(
-                    attachmentId=a.get("id", ""),
-                    name=a.get("name", "") or "",
-                    size=int(a.get("size", 0) or 0),
-                    contentType=a.get("contentType", "") or "",
-                )
-                for a in atts if isinstance(a, dict)
-            ]
+            aurl = f"{GRAPH_BASE}/me/messages/{item.messageId}/attachments?$select=id,name,contentType,size"
+            ar = requests.get(aurl, headers=headers, timeout=30)
+            if ar.status_code < 400:
+                item.attachments = [
+                    AttachmentInfo(
+                        attachmentId=a.get("id",""),
+                        name=a.get("name","") or "",
+                        size=int(a.get("size",0) or 0),
+                        contentType=a.get("contentType","") or "",
+                    )
+                    for a in ar.json().get("value", []) if isinstance(a, dict)
+                ]
         items.append(item)
 
     items.sort(key=lambda x: x.receivedAt or "", reverse=True)
     return SearchResponse(
         items=items,
         summary={"totalMessages": len(items), "totalAttachments": sum(len(i.attachments) for i in items)},
-        debug={"user": user_email, "folder": req.folder, "count": len(items)},
+        debug={"folder": req.folder, "count": len(items)},
     )
 
 @app.post("/download", response_model=DownloadResponse)
 def download(req: DownloadRequest, x_api_key: Optional[str] = Header(None)):
-    check_api_key(x_api_key)
-    user_email = (req.user_email or DEFAULT_USER_EMAIL).strip()
-    if not (user_email and req.message_id and req.attachment_id):
-        raise HTTPException(status_code=400, detail="user_email, message_id, attachment_id are required")
+    _check_api_key(x_api_key)
+    headers = _graph_headers()
 
-    # 1) Get metadata (filename, contentType, size)
-    meta_url = f"{GRAPH_BASE}/users/{user_email}/messages/{req.message_id}/attachments/{req.attachment_id}"
-    meta = requests.get(meta_url, headers=graph_headers(), params={"$select": "id,name,contentType,size"}, timeout=30)
+    meta_url = f"{GRAPH_BASE}/me/messages/{req.message_id}/attachments/{req.attachment_id}?$select=id,name,contentType,size"
+    meta = requests.get(meta_url, headers=headers, timeout=30)
     if meta.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"Graph meta error {meta.status_code}: {meta.text}")
-    meta_json = meta.json()
-    filename = meta_json.get("name") or "attachment.bin"
-    content_type = meta_json.get("contentType") or "application/octet-stream"
-    size = int(meta_json.get("size", 0) or 0)
+    mj = meta.json()
+    filename = mj.get("name") or "attachment.bin"
+    content_type = mj.get("contentType") or "application/octet-stream"
+    size = int(mj.get("size", 0) or 0)
 
-    # 2) Download bytes
-    bin_url = f"{GRAPH_BASE}/users/{user_email}/messages/{req.message_id}/attachments/{req.attachment_id}/$value"
-    bin_res = requests.get(bin_url, headers=graph_headers(), timeout=60)
-    if bin_res.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Graph download error {bin_res.status_code}: {bin_res.text}")
+    bin_url = f"{GRAPH_BASE}/me/messages/{req.message_id}/attachments/{req.attachment_id}/$value"
+    br = requests.get(bin_url, headers=headers, timeout=60)
+    if br.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Graph download error {br.status_code}: {br.text}")
 
-    b64 = base64.b64encode(bin_res.content).decode("ascii")
+    b64 = base64.b64encode(br.content).decode("ascii")
     return DownloadResponse(filename=filename, content_type=content_type, size=size, content_base64=b64)
