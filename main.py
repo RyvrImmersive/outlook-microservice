@@ -48,9 +48,9 @@ except Exception:
 
 _cache_lock = threading.Lock()
 
-# Delegated scopes - don't include reserved scopes (openid, profile, offline_access)
-# MSAL automatically includes these reserved scopes
-SCOPES = ["Mail.Read"]
+# Delegated scopes - specify full Graph API resource URLs for correct audience
+# This ensures tokens have the right audience (https://graph.microsoft.com)
+SCOPES = ["https://graph.microsoft.com/Mail.Read"]
 
 
 # -----------------------------
