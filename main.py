@@ -142,6 +142,26 @@ def _ensure_token() -> str:
 def _graph_headers() -> Dict[str, str]:
     token = _ensure_token()
     print(f"🔑 Using access token: {token[:20]}...{token[-10:] if len(token) > 30 else ''}")
+    
+    # Decode JWT token for debugging (without verification)
+    try:
+        import base64
+        import json
+        # Split JWT token and decode payload
+        parts = token.split('.')
+        if len(parts) >= 2:
+            # Add padding if needed
+            payload = parts[1]
+            payload += '=' * (4 - len(payload) % 4)
+            decoded = base64.b64decode(payload)
+            token_data = json.loads(decoded)
+            print(f"🎫 Token audience: {token_data.get('aud', 'NOT_SET')}")
+            print(f"🎫 Token scopes: {token_data.get('scp', 'NOT_SET')}")
+            print(f"🎫 Token issuer: {token_data.get('iss', 'NOT_SET')}")
+            print(f"🎫 Token expires: {token_data.get('exp', 'NOT_SET')}")
+    except Exception as e:
+        print(f"⚠️  Could not decode token for debugging: {str(e)}")
+    
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -421,6 +441,17 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
         if r.status_code >= 400:
             error_detail = f"Graph list error {r.status_code}: {r.text}"
             print(f"❌ {error_detail}")
+            
+            # Log response headers for debugging
+            print(f"🔍 Response headers: {dict(r.headers)}")
+            
+            # Try to parse JSON error for more details
+            try:
+                error_json = r.json()
+                print(f"📋 Graph API error details: {error_json}")
+            except:
+                print(f"📋 Raw error response: {r.text}")
+                
             raise HTTPException(status_code=502, detail=error_detail)
 
         raw = r.json().get("value", []) or []
