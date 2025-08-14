@@ -115,8 +115,10 @@ def _ensure_token() -> str:
 
 
 def _graph_headers() -> Dict[str, str]:
+    token = _ensure_token()
+    print(f"🔑 Using access token: {token[:20]}...{token[-10:] if len(token) > 30 else ''}")
     return {
-        "Authorization": f"Bearer {_ensure_token()}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
 
@@ -277,23 +279,63 @@ def debug_config():
 
 @app.get("/auth/callback")
 def auth_callback(request: Request):
-    code = request.query_params.get("code")
-    if not code:
-        err = request.query_params.get("error_description") or request.query_params.get("error") or "No code provided"
-        return JSONResponse({"error": err}, status_code=400)
+    try:
+        print(f"🔄 OAuth callback received")
+        code = request.query_params.get("code")
+        error = request.query_params.get("error")
+        error_desc = request.query_params.get("error_description")
+        
+        if error:
+            print(f"❌ OAuth error: {error} - {error_desc}")
+            return JSONResponse({"error": f"{error}: {error_desc}"}, status_code=400)
+            
+        if not code:
+            print(f"❌ No authorization code received")
+            return JSONResponse({"error": "No authorization code provided"}, status_code=400)
 
-    with _cache_lock:
-        cache = _load_cache()
-        appc = _build_app(cache)
-        result = appc.acquire_token_by_authorization_code(code, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+        print(f"✅ Authorization code received: {code[:20]}...")
 
-        if "access_token" not in result:
-            # Surface MSAL error for diagnostics
-            return JSONResponse({"error": result}, status_code=400)
+        with _cache_lock:
+            cache = _load_cache()
+            appc = _build_app(cache)
+            
+            print(f"🔄 Acquiring token by authorization code...")
+            result = appc.acquire_token_by_authorization_code(
+                code, 
+                scopes=SCOPES, 
+                redirect_uri=REDIRECT_URI
+            )
 
-        _save_cache(cache)
+            print(f"📊 Token acquisition result keys: {list(result.keys())}")
+            
+            if "access_token" not in result:
+                print(f"❌ Token acquisition failed: {result}")
+                return JSONResponse({"error": "Token acquisition failed", "details": result}, status_code=400)
 
-    return JSONResponse({"ok": True, "message": "Authorized. You can close this tab."})
+            # Log successful token info (without exposing the actual token)
+            token_info = {
+                "has_access_token": "access_token" in result,
+                "has_refresh_token": "refresh_token" in result,
+                "expires_in": result.get("expires_in"),
+                "scope": result.get("scope"),
+                "token_type": result.get("token_type")
+            }
+            print(f"✅ Token acquired successfully: {token_info}")
+            
+            _save_cache(cache)
+            print(f"💾 Token cache saved")
+
+        return JSONResponse({
+            "ok": True, 
+            "message": "Authorized successfully. You can close this tab.",
+            "token_info": token_info
+        })
+        
+    except Exception as e:
+        print(f"💥 OAuth callback error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"error": f"OAuth callback failed: {str(e)}"}, status_code=500)
 
 
 # -----------------------------
