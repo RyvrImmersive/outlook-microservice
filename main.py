@@ -170,7 +170,9 @@ def _check_api_key(x_api_key: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+# FIX 1: Handle both GET and HEAD requests for health checks
 @app.get("/")
+@app.head("/")
 def root():
     return {
         "ok": True,
@@ -180,12 +182,15 @@ def root():
         "health": "/healthz",
         "authority": AUTHORITY,
         "redirect_uri": REDIRECT_URI,
+        "status": "running"
     }
 
 
+# FIX 2: Also handle HEAD requests for health endpoint
 @app.get("/healthz")
+@app.head("/healthz")
 def healthz():
-    return {"ok": True}
+    return {"ok": True, "status": "healthy"}
 
 
 # -----------------------------
@@ -336,10 +341,25 @@ def download(req: DownloadRequest, x_api_key: Optional[str] = Header(None)):
     return DownloadResponse(filename=filename, content_type=content_type, size=size, content_base64=b64)
 
 
+# FIX 3: Add startup event to log configuration
+@app.on_event("startup")
+async def startup_event():
+    print(f"🚀 Service starting up...")
+    print(f"📍 Authority: {AUTHORITY}")
+    print(f"🔄 Redirect URI: {REDIRECT_URI}")
+    print(f"🗂️ Token cache path: {TOKEN_PATH}")
+    if API_KEY:
+        print("🔐 API key protection enabled")
+    else:
+        print("⚠️  No API key protection")
+
+
 # -----------------------------
-# Local run
+# Local run - FIX 4: Proper port handling
 # -----------------------------
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", "8000"))
+    # Use PORT environment variable (what Render sets), fallback to 8000 for local dev
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Starting server on port {port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port)
