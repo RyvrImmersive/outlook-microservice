@@ -198,21 +198,63 @@ def healthz():
 # -----------------------------
 @app.get("/auth/start")
 def auth_start():
-    cache = _load_cache()
-    appc = _build_app(cache)
-    auth_url = appc.get_authorization_request_url(
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-        prompt="select_account",
-        response_mode="query",
-    )
-    return RedirectResponse(auth_url)
+    try:
+        # Debug logging
+        print(f"🔐 Starting OAuth flow...")
+        print(f"📍 Authority: {AUTHORITY}")
+        print(f"🆔 Client ID: {CLIENT_ID[:8]}...")
+        print(f"🔄 Redirect URI: {REDIRECT_URI}")
+        print(f"📝 Scopes: {SCOPES}")
+        
+        cache = _load_cache()
+        appc = _build_app(cache)
+        
+        auth_url = appc.get_authorization_request_url(
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI,
+            prompt="select_account",
+            response_mode="query",
+        )
+        
+        print(f"✅ Generated auth URL: {auth_url[:100]}...")
+        return RedirectResponse(auth_url)
+        
+    except Exception as e:
+        print(f"❌ Error in auth_start: {str(e)}")
+        print(f"📊 Error type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
+        
+        return JSONResponse({
+            "error": "OAuth initialization failed",
+            "details": str(e),
+            "authority": AUTHORITY,
+            "client_id_prefix": CLIENT_ID[:8] if CLIENT_ID else "NOT_SET",
+            "redirect_uri": REDIRECT_URI
+        }, status_code=500)
 
 
 # alias
 @app.get("/login")
 def login_alias():
     return auth_start()
+
+
+@app.get("/debug/config")
+def debug_config():
+    """Debug endpoint to check configuration (remove in production)"""
+    return {
+        "authority": AUTHORITY,
+        "client_id_set": bool(CLIENT_ID),
+        "client_id_prefix": CLIENT_ID[:8] if CLIENT_ID else "NOT_SET",
+        "client_secret_set": bool(CLIENT_SECRET),
+        "redirect_uri": REDIRECT_URI,
+        "redirect_uri_set": bool(REDIRECT_URI),
+        "tenant_id": TENANT_ID or "NOT_SET",
+        "api_key_set": bool(API_KEY),
+        "token_path": TOKEN_PATH,
+        "scopes": SCOPES
+    }
 
 
 @app.get("/auth/callback")
