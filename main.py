@@ -88,12 +88,29 @@ def _ensure_token() -> str:
         cache = _load_cache()
         app = _build_app(cache)
         accounts = app.get_accounts()
+        
+        print(f"🔍 Found {len(accounts)} accounts in cache")
+        
         result = None
         if accounts:
+            print(f"👤 Using account: {accounts[0].get('username', 'unknown')}")
             result = app.acquire_token_silent(SCOPES, account=accounts[0])
+            
+            if result and "access_token" in result:
+                print("✅ Token acquired silently (refreshed)")
+            else:
+                print(f"❌ Silent token acquisition failed: {result}")
+        
         if not result or "access_token" not in result:
-            raise HTTPException(status_code=401, detail="Not authorized. Visit /auth/start to sign in.")
+            error_msg = "Token expired or invalid. Please re-authorize at /auth/start"
+            if result and "error" in result:
+                error_msg += f" (MSAL Error: {result.get('error_description', result.get('error'))})"
+            
+            print(f"🚫 {error_msg}")
+            raise HTTPException(status_code=401, detail=error_msg)
+        
         _save_cache(cache)
+        print("🎯 Returning valid access token")
         return result["access_token"]
 
 
@@ -302,63 +319,82 @@ def _normalize_message(m: Dict[str, Any]) -> MessageItem:
 @app.post("/search", response_model=SearchResponse)
 def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
     _check_api_key(x_api_key)
-    headers = _graph_headers()
+    
+    try:
+        headers = _graph_headers()
+        print(f"🔍 Searching emails: days_back={req.days_back}, top={req.top}")
+        
+        since = (datetime.now(timezone.utc) - timedelta(days=req.days_back)).isoformat()
+        filters = [f"receivedDateTime ge {since}"]
 
-    since = (datetime.now(timezone.utc) - timedelta(days=req.days_back)).isoformat()
-    filters = [f"receivedDateTime ge {since}"]
+        if req.sender_email:
+            addr = req.sender_email.replace("'", "''").lower()
+            filters.append(f"from/emailAddress/address eq '{addr}'")
+        if req.subject_contains:
+            sub = req.subject_contains.replace("'", "''")
+            filters.append(f"contains(subject,'{sub}')")
+        if req.has_attachments is True:
+            filters.append("hasAttachments eq true")
+        if req.has_attachments is False:
+            filters.append("hasAttachments eq false")
 
-    if req.sender_email:
-        addr = req.sender_email.replace("'", "''").lower()
-        filters.append(f"from/emailAddress/address eq '{addr}'")
-    if req.subject_contains:
-        sub = req.subject_contains.replace("'", "''")
-        filters.append(f"contains(subject,'{sub}')")
-    if req.has_attachments is True:
-        filters.append("hasAttachments eq true")
-    if req.has_attachments is False:
-        filters.append("hasAttachments eq false")
+        params = {
+            "$select": "id,subject,from,receivedDateTime,webLink,hasAttachments",
+            "$orderby": "receivedDateTime desc",
+            "$top": str(req.top),
+            "$filter": " and ".join(filters),
+        }
 
-    params = {
-        "$select": "id,subject,from,receivedDateTime,webLink,hasAttachments",
-        "$orderby": "receivedDateTime desc",
-        "$top": str(req.top),
-        "$filter": " and ".join(filters),
-    }
+        url = f"{GRAPH_BASE}/me/mailFolders/{req.folder or 'inbox'}/messages"
+        print(f"🌐 Graph API URL: {url}")
+        
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        print(f"📊 Graph API Response: {r.status_code}")
+        
+        if r.status_code >= 400:
+            error_detail = f"Graph list error {r.status_code}: {r.text}"
+            print(f"❌ {error_detail}")
+            raise HTTPException(status_code=502, detail=error_detail)
 
-    url = f"{GRAPH_BASE}/me/mailFolders/{req.folder or 'inbox'}/messages"
-    r = requests.get(url, headers=headers, params=params, timeout=30)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Graph list error {r.status_code}: {r.text}")
+        raw = r.json().get("value", []) or []
+        items: List[MessageItem] = []
 
-    raw = r.json().get("value", []) or []
-    items: List[MessageItem] = []
+        for m in raw:
+            item = _normalize_message(m)
+            if item.hasAttachments:
+                aurl = f"{GRAPH_BASE}/me/messages/{item.messageId}/attachments?$select=id,name,contentType,size"
+                ar = requests.get(aurl, headers=headers, timeout=30)
+                if ar.status_code < 400:
+                    item.attachments = [
+                        AttachmentInfo(
+                            attachmentId=a.get("id", ""),
+                            name=a.get("name", "") or "",
+                            size=int(a.get("size", 0) or 0),
+                            contentType=a.get("contentType", "") or "",
+                        )
+                        for a in ar.json().get("value", []) if isinstance(a, dict)
+                    ]
+            items.append(item)
 
-    for m in raw:
-        item = _normalize_message(m)
-        if item.hasAttachments:
-            aurl = f"{GRAPH_BASE}/me/messages/{item.messageId}/attachments?$select=id,name,contentType,size"
-            ar = requests.get(aurl, headers=headers, timeout=30)
-            if ar.status_code < 400:
-                item.attachments = [
-                    AttachmentInfo(
-                        attachmentId=a.get("id", ""),
-                        name=a.get("name", "") or "",
-                        size=int(a.get("size", 0) or 0),
-                        contentType=a.get("contentType", "") or "",
-                    )
-                    for a in ar.json().get("value", []) if isinstance(a, dict)
-                ]
-        items.append(item)
-
-    items.sort(key=lambda x: x.receivedAt or "", reverse=True)
-    return SearchResponse(
-        items=items,
-        summary={
-            "totalMessages": len(items),
-            "totalAttachments": sum(len(i.attachments) for i in items),
-        },
-        debug={"folder": req.folder, "count": len(items)},
-    )
+        items.sort(key=lambda x: x.receivedAt or "", reverse=True)
+        print(f"✅ Found {len(items)} messages")
+        
+        return SearchResponse(
+            items=items,
+            summary={
+                "totalMessages": len(items),
+                "totalAttachments": sum(len(i.attachments) for i in items),
+            },
+            debug={"folder": req.folder, "count": len(items)},
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"💥 Unexpected error in search: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
 @app.post("/download", response_model=DownloadResponse)
