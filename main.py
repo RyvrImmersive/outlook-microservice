@@ -1,30 +1,50 @@
-# main.py — Delegated OAuth (Authorization Code + refresh token)
-import base64, json, os, threading
+# main.py — Outlook delegated OAuth microservice (FastAPI + MSAL)
+# Start command (Render): uvicorn main:app --host 0.0.0.0 --port $PORT
+
+import base64
+import json
+import os
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import msal
 import requests
-from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+# -----------------------------
+# Environment / configuration
+# -----------------------------
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
 CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "").strip()
 AUTHORITY = os.getenv("AUTHORITY", "https://login.microsoftonline.com/common").strip()
 REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
-API_KEY = os.getenv("API_KEY", "").strip()  # optional
+API_KEY = os.getenv("API_KEY", "").strip()  # optional shared secret
 
 if not (CLIENT_ID and CLIENT_SECRET and REDIRECT_URI):
     raise RuntimeError("Set CLIENT_ID, CLIENT_SECRET, REDIRECT_URI env vars.")
 
-# where we store a single-user token cache (fine for your use case)
-TOKEN_PATH = os.getenv("TOKEN_PATH", "/data/ms_tokens.json")
-os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+# ---- token cache path with safe fallback ----
+DEFAULT_TOKEN_PATH = "/data/ms_tokens.json"   # persistent if a Render Disk is mounted at /data
+TOKEN_PATH = os.getenv("TOKEN_PATH", DEFAULT_TOKEN_PATH)
+try:
+    os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+except Exception:
+    TOKEN_PATH = "/tmp/ms_tokens.json"        # ephemeral (lost on restart)
+    os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+
 _cache_lock = threading.Lock()
 
-# ---- MSAL helpers ----
+# OAuth scopes for delegated access
+SCOPES = ["Mail.Read", "offline_access", "openid", "profile"]
+
+# -----------------------------
+# MSAL helpers
+# -----------------------------
 def _load_cache() -> msal.SerializableTokenCache:
     cache = msal.SerializableTokenCache()
     if os.path.exists(TOKEN_PATH):
@@ -34,7 +54,7 @@ def _load_cache() -> msal.SerializableTokenCache:
             pass
     return cache
 
-def _save_cache(cache: msal.SerializableTokenCache):
+def _save_cache(cache: msal.SerializableTokenCache) -> None:
     if cache.has_state_changed:
         with open(TOKEN_PATH, "w") as f:
             f.write(cache.serialize())
@@ -47,10 +67,8 @@ def _build_app(cache: Optional[msal.SerializableTokenCache] = None) -> msal.Conf
         token_cache=cache,
     )
 
-SCOPES = ["Mail.Read", "offline_access", "openid", "profile"]
-
 def _ensure_token() -> str:
-    """Return a valid access token using the stored refresh token (silent flow)."""
+    """Return a valid access token, refreshing silently via refresh token."""
     with _cache_lock:
         cache = _load_cache()
         app = _build_app(cache)
@@ -63,14 +81,19 @@ def _ensure_token() -> str:
         _save_cache(cache)
         return result["access_token"]
 
-# ---- FastAPI models ----
+def _graph_headers() -> Dict[str, str]:
+    return {"Authorization": f"Bearer {_ensure_token()}"}
+
+# -----------------------------
+# Models
+# -----------------------------
 class SearchRequest(BaseModel):
     sender_email: Optional[str] = None
     subject_contains: Optional[str] = None
     days_back: int = Field(30, ge=0, le=365)
     top: int = Field(25, ge=1, le=100)
     folder: str = Field("inbox")
-    has_attachments: Optional[bool] = None
+    has_attachments: Optional[bool] = None  # true/false filter
 
 class AttachmentInfo(BaseModel):
     attachmentId: str
@@ -103,26 +126,36 @@ class DownloadResponse(BaseModel):
     size: int
     content_base64: str
 
-# ---- FastAPI app ----
-app = FastAPI(title="Outlook Delegated Microservice", version="1.0.0")
+# -----------------------------
+# FastAPI app & utilities
+# -----------------------------
+app = FastAPI(title="Outlook Delegated Microservice", version="1.1.0")
 
-def _check_api_key(x_api_key: Optional[str]):
+def _check_api_key(x_api_key: Optional[str]) -> None:
     if API_KEY and (x_api_key or "").strip() != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 @app.get("/")
 def root():
-    return {"ok": True, "auth": "/auth/start", "docs": "/docs"}
+    return {
+        "ok": True,
+        "service": "Outlook Delegated Microservice",
+        "docs": "/docs",
+        "auth_start": "/auth/start",
+        "health": "/healthz"
+    }
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
+# -----------------------------
+# Auth endpoints
+# -----------------------------
 @app.get("/auth/start")
 def auth_start():
     cache = _load_cache()
     appc = _build_app(cache)
-    # Create login URL
     auth_url = appc.get_authorization_request_url(
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI,
@@ -135,7 +168,7 @@ def auth_start():
 def auth_callback(request: Request):
     code = request.query_params.get("code")
     if not code:
-        err = request.query_params.get("error_description", "No code")
+        err = request.query_params.get("error_description", "No code provided")
         return JSONResponse({"error": err}, status_code=400)
     with _cache_lock:
         cache = _load_cache()
@@ -146,9 +179,9 @@ def auth_callback(request: Request):
         _save_cache(cache)
     return JSONResponse({"ok": True, "message": "Authorized. You can close this tab."})
 
-def _graph_headers() -> Dict[str, str]:
-    return {"Authorization": f"Bearer {_ensure_token()}"}
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def _normalize_message(m: Dict[str, Any]) -> MessageItem:
     ea = ((m.get("from") or {}).get("emailAddress") or {})
     return MessageItem(
@@ -162,21 +195,23 @@ def _normalize_message(m: Dict[str, Any]) -> MessageItem:
         attachments=[],
     )
 
+# -----------------------------
+# Business endpoints
+# -----------------------------
 @app.post("/search", response_model=SearchResponse)
 def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
     _check_api_key(x_api_key)
     headers = _graph_headers()
 
-    # Build OData filters
-    from datetime import timedelta
     since = (datetime.now(timezone.utc) - timedelta(days=req.days_back)).isoformat()
     filters = [f"receivedDateTime ge {since}"]
+
     if req.sender_email:
         addr = req.sender_email.replace("'", "''").lower()
         filters.append(f"from/emailAddress/address eq '{addr}'")
     if req.subject_contains:
-        val = req.subject_contains.replace("'", "''")
-        filters.append(f"contains(subject,'{val}')")
+        sub = req.subject_contains.replace("'", "''")
+        filters.append(f"contains(subject,'{sub}')")
     if req.has_attachments is True:
         filters.append("hasAttachments eq true")
     if req.has_attachments is False:
@@ -188,6 +223,7 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
         "$top": str(req.top),
         "$filter": " and ".join(filters),
     }
+
     url = f"{GRAPH_BASE}/me/mailFolders/{req.folder or 'inbox'}/messages"
     r = requests.get(url, headers=headers, params=params, timeout=30)
     if r.status_code >= 400:
@@ -203,10 +239,10 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
             if ar.status_code < 400:
                 item.attachments = [
                     AttachmentInfo(
-                        attachmentId=a.get("id",""),
-                        name=a.get("name","") or "",
-                        size=int(a.get("size",0) or 0),
-                        contentType=a.get("contentType","") or "",
+                        attachmentId=a.get("id", ""),
+                        name=a.get("name", "") or "",
+                        size=int(a.get("size", 0) or 0),
+                        contentType=a.get("contentType", "") or "",
                     )
                     for a in ar.json().get("value", []) if isinstance(a, dict)
                 ]
@@ -215,7 +251,10 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
     items.sort(key=lambda x: x.receivedAt or "", reverse=True)
     return SearchResponse(
         items=items,
-        summary={"totalMessages": len(items), "totalAttachments": sum(len(i.attachments) for i in items)},
+        summary={
+            "totalMessages": len(items),
+            "totalAttachments": sum(len(i.attachments) for i in items)
+        },
         debug={"folder": req.folder, "count": len(items)},
     )
 
