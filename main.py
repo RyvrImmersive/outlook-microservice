@@ -58,19 +58,44 @@ SCOPES = ["Mail.Read"]
 # -----------------------------
 def _load_cache() -> msal.SerializableTokenCache:
     cache = msal.SerializableTokenCache()
+    print(f"📂 Loading token cache from: {TOKEN_PATH}")
     if os.path.exists(TOKEN_PATH):
         try:
             with open(TOKEN_PATH, "r") as f:
-                cache.deserialize(f.read())
-        except Exception:
-            pass
+                cache_data = f.read()
+                cache.deserialize(cache_data)
+                print(f"✅ Token cache loaded successfully ({len(cache_data)} chars)")
+        except Exception as e:
+            print(f"❌ Failed to load token cache: {str(e)}")
+    else:
+        print(f"⚠️  Token cache file does not exist: {TOKEN_PATH}")
     return cache
 
 
 def _save_cache(cache: msal.SerializableTokenCache) -> None:
+    print(f"💾 Saving token cache to: {TOKEN_PATH}")
+    print(f"📊 Cache has state changed: {cache.has_state_changed}")
     if cache.has_state_changed:
-        with open(TOKEN_PATH, "w") as f:
-            f.write(cache.serialize())
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+            with open(TOKEN_PATH, "w") as f:
+                cache_data = cache.serialize()
+                f.write(cache_data)
+                print(f"✅ Token cache saved successfully ({len(cache_data)} chars)")
+        except Exception as e:
+            print(f"❌ Failed to save token cache: {str(e)}")
+            # Try fallback path
+            fallback_path = "/tmp/ms_tokens.json"
+            print(f"🔄 Trying fallback path: {fallback_path}")
+            try:
+                with open(fallback_path, "w") as f:
+                    f.write(cache.serialize())
+                print(f"✅ Token cache saved to fallback path")
+            except Exception as e2:
+                print(f"❌ Fallback save also failed: {str(e2)}")
+    else:
+        print(f"ℹ️  No cache changes to save")
 
 
 def _build_app(cache: Optional[msal.SerializableTokenCache] = None) -> msal.ConfidentialClientApplication:
