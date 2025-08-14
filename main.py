@@ -2,7 +2,6 @@
 # Start command (Render): uvicorn main:app --host 0.0.0.0 --port $PORT
 
 import base64
-import json
 import os
 import threading
 from datetime import datetime, timedelta, timezone
@@ -49,7 +48,8 @@ def _load_cache() -> msal.SerializableTokenCache:
     cache = msal.SerializableTokenCache()
     if os.path.exists(TOKEN_PATH):
         try:
-            cache.deserialize(open(TOKEN_PATH, "r").read())
+            with open(TOKEN_PATH, "r") as f:
+                cache.deserialize(f.read())
         except Exception:
             pass
     return cache
@@ -129,7 +129,7 @@ class DownloadResponse(BaseModel):
 # -----------------------------
 # FastAPI app & utilities
 # -----------------------------
-app = FastAPI(title="Outlook Delegated Microservice", version="1.1.0")
+app = FastAPI(title="Outlook Delegated Microservice", version="1.2.0")
 
 def _check_api_key(x_api_key: Optional[str]) -> None:
     if API_KEY and (x_api_key or "").strip() != API_KEY:
@@ -187,7 +187,7 @@ def _normalize_message(m: Dict[str, Any]) -> MessageItem:
     return MessageItem(
         messageId=m.get("id", ""),
         subject=m.get("subject", "") or "",
-        **{"from": ea.get("address", "") or ""},
+        **{"from": (ea.get("address", "") or "").lower()},
         fromName=ea.get("name", "") or "",
         receivedAt=m.get("receivedDateTime", "") or "",
         webLink=m.get("webLink", ""),
