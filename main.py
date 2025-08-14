@@ -322,6 +322,48 @@ def debug_config():
     }
 
 
+@app.get("/debug/graph-test")
+def debug_graph_test(x_api_key: Optional[str] = Header(None)):
+    """Test basic Graph API connectivity with /me endpoint"""
+    _check_api_key(x_api_key)
+    
+    try:
+        headers = _graph_headers()
+        
+        # Test with simplest Graph API endpoint
+        test_url = f"{GRAPH_BASE}/me"
+        print(f"🧪 Testing Graph API connectivity: {test_url}")
+        
+        r = requests.get(test_url, headers=headers, timeout=30)
+        print(f"📊 Graph /me Response: {r.status_code}")
+        
+        if r.status_code >= 400:
+            print(f"❌ Graph /me error: {r.text}")
+            print(f"🔍 Response headers: {dict(r.headers)}")
+            
+            try:
+                error_json = r.json()
+                print(f"📋 Graph /me error details: {error_json}")
+                return {"error": "Graph API test failed", "status": r.status_code, "details": error_json}
+            except:
+                return {"error": "Graph API test failed", "status": r.status_code, "raw_response": r.text}
+        
+        user_info = r.json()
+        print(f"✅ Graph API test successful: {user_info.get('userPrincipalName', 'unknown')}")
+        
+        return {
+            "success": True,
+            "user_principal_name": user_info.get("userPrincipalName"),
+            "display_name": user_info.get("displayName"),
+            "id": user_info.get("id"),
+            "status": r.status_code
+        }
+        
+    except Exception as e:
+        print(f"💥 Graph API test error: {str(e)}")
+        return {"error": f"Graph API test failed: {str(e)}"}
+
+
 @app.get("/auth/callback")
 def auth_callback(request: Request):
     try:
