@@ -48,8 +48,9 @@ except Exception:
 
 _cache_lock = threading.Lock()
 
-# Delegated scopes
-SCOPES = ["Mail.Read", "offline_access", "openid", "profile"]
+# Delegated scopes - don't include reserved scopes (openid, profile, offline_access)
+# MSAL automatically includes these reserved scopes
+SCOPES = ["Mail.Read"]
 
 
 # -----------------------------
