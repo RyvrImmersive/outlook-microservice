@@ -1,5 +1,5 @@
 # main.py — Outlook delegated OAuth microservice (FastAPI + MSAL)
-# Start command (Render): uvicorn main:app --host 0.0.0.0 --port $PORT
+# Run (Render): uvicorn main:app --host 0.0.0.0 --port $PORT
 
 import base64
 import os
@@ -279,3 +279,10 @@ def download(req: DownloadRequest, x_api_key: Optional[str] = Header(None)):
 
     b64 = base64.b64encode(br.content).decode("ascii")
     return DownloadResponse(filename=filename, content_type=content_type, size=size, content_base64=b64)
+
+
+# Optional local run
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
