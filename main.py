@@ -1,5 +1,5 @@
 # main.py — Outlook delegated OAuth microservice (FastAPI + MSAL)
-# Run (Render): uvicorn main:app --host 0.0.0.0 --port $PORT
+# Start (Render): uvicorn main:app --host 0.0.0.0 --port $PORT
 
 import base64
 import os
@@ -10,8 +10,10 @@ from typing import Any, Dict, List, Optional
 import msal
 import requests
 from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel, Field
+
 
 # -----------------------------
 # Environment / configuration
@@ -20,26 +22,35 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "").strip()
-AUTHORITY = os.getenv("AUTHORITY", "https://login.microsoftonline.com/common").strip()
+TENANT_ID = os.getenv("TENANT_ID", "").strip()
+# If TENANT_ID provided, prefer it. Otherwise allow explicit AUTHORITY or default to "common".
+AUTHORITY = (
+    f"https://login.microsoftonline.com/{TENANT_ID}"
+    if TENANT_ID
+    else os.getenv("AUTHORITY", "https://login.microsoftonline.com/common").strip()
+)
 REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
-API_KEY = os.getenv("API_KEY", "").strip()  # optional shared secret
+
+# Optional shared secret to protect /search and /download
+API_KEY = os.getenv("API_KEY", "").strip()
 
 if not (CLIENT_ID and CLIENT_SECRET and REDIRECT_URI):
-    raise RuntimeError("Set CLIENT_ID, CLIENT_SECRET, REDIRECT_URI env vars.")
+    raise RuntimeError("Set CLIENT_ID, CLIENT_SECRET, and REDIRECT_URI environment variables.")
 
-# ---- token cache path with safe fallback ----
-DEFAULT_TOKEN_PATH = "/data/ms_tokens.json"   # persistent if a Render Disk is mounted at /data
+# Token cache path with safe fallback (/data if mounted; else /tmp)
+DEFAULT_TOKEN_PATH = "/data/ms_tokens.json"
 TOKEN_PATH = os.getenv("TOKEN_PATH", DEFAULT_TOKEN_PATH)
 try:
     os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
 except Exception:
-    TOKEN_PATH = "/tmp/ms_tokens.json"        # ephemeral (lost on restart)
+    TOKEN_PATH = "/tmp/ms_tokens.json"
     os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
 
 _cache_lock = threading.Lock()
 
-# OAuth scopes for delegated access
+# Delegated scopes
 SCOPES = ["Mail.Read", "offline_access", "openid", "profile"]
+
 
 # -----------------------------
 # MSAL helpers
@@ -54,10 +65,12 @@ def _load_cache() -> msal.SerializableTokenCache:
             pass
     return cache
 
+
 def _save_cache(cache: msal.SerializableTokenCache) -> None:
     if cache.has_state_changed:
         with open(TOKEN_PATH, "w") as f:
             f.write(cache.serialize())
+
 
 def _build_app(cache: Optional[msal.SerializableTokenCache] = None) -> msal.ConfidentialClientApplication:
     return msal.ConfidentialClientApplication(
@@ -67,8 +80,9 @@ def _build_app(cache: Optional[msal.SerializableTokenCache] = None) -> msal.Conf
         token_cache=cache,
     )
 
+
 def _ensure_token() -> str:
-    """Return a valid access token, refreshing silently via refresh token."""
+    """Return a valid access token, refreshing silently (via refresh token) if possible."""
     with _cache_lock:
         cache = _load_cache()
         app = _build_app(cache)
@@ -81,11 +95,16 @@ def _ensure_token() -> str:
         _save_cache(cache)
         return result["access_token"]
 
+
 def _graph_headers() -> Dict[str, str]:
-    return {"Authorization": f"Bearer {_ensure_token()}"}
+    return {
+        "Authorization": f"Bearer {_ensure_token()}",
+        "Accept": "application/json",
+    }
+
 
 # -----------------------------
-# Models
+# Pydantic models
 # -----------------------------
 class SearchRequest(BaseModel):
     sender_email: Optional[str] = None
@@ -95,11 +114,13 @@ class SearchRequest(BaseModel):
     folder: str = Field("inbox")
     has_attachments: Optional[bool] = None  # true/false filter
 
+
 class AttachmentInfo(BaseModel):
     attachmentId: str
     name: str
     size: int
     contentType: str
+
 
 class MessageItem(BaseModel):
     messageId: str
@@ -111,14 +132,17 @@ class MessageItem(BaseModel):
     hasAttachments: bool
     attachments: List[AttachmentInfo] = []
 
+
 class SearchResponse(BaseModel):
     items: List[MessageItem]
     summary: Dict[str, Any] = {}
     debug: Dict[str, Any] = {}
 
+
 class DownloadRequest(BaseModel):
     message_id: str
     attachment_id: str
+
 
 class DownloadResponse(BaseModel):
     filename: str
@@ -126,14 +150,25 @@ class DownloadResponse(BaseModel):
     size: int
     content_base64: str
 
+
 # -----------------------------
-# FastAPI app & utilities
+# FastAPI app
 # -----------------------------
-app = FastAPI(title="Outlook Delegated Microservice", version="1.2.0")
+app = FastAPI(title="Outlook Delegated Microservice", version="1.3.0")
+
+# CORS (adjust origins if you want to restrict)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 def _check_api_key(x_api_key: Optional[str]) -> None:
     if API_KEY and (x_api_key or "").strip() != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
 
 @app.get("/")
 def root():
@@ -142,15 +177,19 @@ def root():
         "service": "Outlook Delegated Microservice",
         "docs": "/docs",
         "auth_start": "/auth/start",
-        "health": "/healthz"
+        "health": "/healthz",
+        "authority": AUTHORITY,
+        "redirect_uri": REDIRECT_URI,
     }
+
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
+
 # -----------------------------
-# Auth endpoints
+# OAuth endpoints
 # -----------------------------
 @app.get("/auth/start")
 def auth_start():
@@ -164,20 +203,33 @@ def auth_start():
     )
     return RedirectResponse(auth_url)
 
+
+# alias
+@app.get("/login")
+def login_alias():
+    return auth_start()
+
+
 @app.get("/auth/callback")
 def auth_callback(request: Request):
     code = request.query_params.get("code")
     if not code:
-        err = request.query_params.get("error_description", "No code provided")
+        err = request.query_params.get("error_description") or request.query_params.get("error") or "No code provided"
         return JSONResponse({"error": err}, status_code=400)
+
     with _cache_lock:
         cache = _load_cache()
         appc = _build_app(cache)
         result = appc.acquire_token_by_authorization_code(code, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+
         if "access_token" not in result:
+            # Surface MSAL error for diagnostics
             return JSONResponse({"error": result}, status_code=400)
+
         _save_cache(cache)
+
     return JSONResponse({"ok": True, "message": "Authorized. You can close this tab."})
+
 
 # -----------------------------
 # Helpers
@@ -195,8 +247,9 @@ def _normalize_message(m: Dict[str, Any]) -> MessageItem:
         attachments=[],
     )
 
+
 # -----------------------------
-# Business endpoints
+# Search & Download
 # -----------------------------
 @app.post("/search", response_model=SearchResponse)
 def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
@@ -231,6 +284,7 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
 
     raw = r.json().get("value", []) or []
     items: List[MessageItem] = []
+
     for m in raw:
         item = _normalize_message(m)
         if item.hasAttachments:
@@ -253,10 +307,11 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
         items=items,
         summary={
             "totalMessages": len(items),
-            "totalAttachments": sum(len(i.attachments) for i in items)
+            "totalAttachments": sum(len(i.attachments) for i in items),
         },
         debug={"folder": req.folder, "count": len(items)},
     )
+
 
 @app.post("/download", response_model=DownloadResponse)
 def download(req: DownloadRequest, x_api_key: Optional[str] = Header(None)):
@@ -281,7 +336,9 @@ def download(req: DownloadRequest, x_api_key: Optional[str] = Header(None)):
     return DownloadResponse(filename=filename, content_type=content_type, size=size, content_base64=b64)
 
 
-# Optional local run
+# -----------------------------
+# Local run
+# -----------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))
